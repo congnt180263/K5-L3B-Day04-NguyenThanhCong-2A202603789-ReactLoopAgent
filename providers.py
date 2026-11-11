@@ -1,8 +1,35 @@
 """Bốn provider cùng một interface. Không chứa agent loop."""
+import http.client
 import json
 import os
+import time
 import urllib.error
 import urllib.request
+import uuid
+
+
+def _load_dotenv():
+    env_file = os.path.join(os.path.dirname(__file__), '.env')
+    if os.path.isfile(env_file):
+        try:
+            with open(env_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if line.startswith('export '):
+                        line = line[7:].strip()
+                    if '=' in line:
+                        k, v = line.split('=', 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        if k:
+                            os.environ[k] = v
+        except Exception:
+            pass
+
+
+_load_dotenv()
 
 CONFIG = {
     'openai': ('OPENAI_API_KEY', 'https://api.openai.com/v1/chat/completions'),
@@ -12,16 +39,39 @@ CONFIG = {
 }
 
 
-def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+def post_json(url, headers, payload, max_retries=2):
+    req_headers = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) StatusAgentLab/1.0',
+        **headers,
+    }
+    if 'opencode.ai' in url and 'x-opencode-session' not in req_headers:
+        req_headers['x-opencode-session'] = f'ses_{uuid.uuid4().hex}'
+
+    for attempt in range(max_retries + 1):
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=req_headers)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            try:
+                err_body = exc.read().decode('utf-8', errors='ignore')
+            except Exception:
+                err_body = ''
+            msg = f'Provider trả HTTP {exc.code}'
+            if err_body:
+                msg += f': {err_body[:300]}'
+            else:
+                msg += '; kiểm tra model, key và quota.'
+            raise RuntimeError(msg) from exc
+        except (urllib.error.URLError, http.client.RemoteDisconnected, ConnectionResetError, TimeoutError, OSError) as exc:
+            if attempt < max_retries:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise RuntimeError(f'Không kết nối được provider: {exc}') from exc
 
 
 class Provider:
@@ -33,11 +83,23 @@ class Provider:
     def __init__(self, name, model):
         if name not in CONFIG:
             raise ValueError(f'Provider không hợp lệ: {name}')
+        model = model or os.getenv('MODEL') or os.getenv('API_MODEL')
         if not model:
             raise ValueError('Cần đặt MODEL là model có hỗ trợ tool calling.')
         self.name, self.model = name, model
-        key_name, self.url = CONFIG[name]
-        self.key = os.getenv(key_name)
+        key_name, default_url = CONFIG[name]
+
+        custom_endpoint = os.getenv('API_ENDPOINT') or os.getenv('OPENAI_BASE_URL')
+        if name == 'openai' and custom_endpoint:
+            endpoint = custom_endpoint.rstrip('/')
+            if not endpoint.endswith('/chat/completions'):
+                self.url = f'{endpoint}/chat/completions'
+            else:
+                self.url = endpoint
+        else:
+            self.url = default_url
+
+        self.key = os.getenv(key_name) or (os.getenv('API_KEY') if name == 'openai' else None)
         if not self.key:
             raise ValueError(f'Thiếu {key_name}; xem README.md.')
 
@@ -47,10 +109,19 @@ class Provider:
         payload = {'model': self.model, 'messages': messages}
         if schemas:
             payload['tools'] = schemas
-        data = post_json(self.url, {'Authorization': f'Bearer {self.key}'}, payload)
+        for attempt in range(3):
+            data = post_json(self.url, {'Authorization': f'Bearer {self.key}'}, payload)
+            if isinstance(data, dict) and ('error' in data or 'choices' not in data or not data.get('choices')):
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                err_info = data.get('error') or f'Response thiếu choices: {json.dumps(data, ensure_ascii=False)[:300]}'
+                raise RuntimeError(f'Provider trả lỗi: {err_info}')
+            break
         choice = data['choices'][0]
         message = choice['message']
-        calls = [{'id': c['id'], 'name': c['function']['name'], 'arguments': c['function']['arguments']} for c in message.get('tool_calls', [])]
+        tool_calls = message.get('tool_calls') or []
+        calls = [{'id': c['id'], 'name': c['function']['name'], 'arguments': c['function']['arguments']} for c in tool_calls]
         return {'message': message, 'calls': calls, 'finish': choice.get('finish_reason'), 'usage': data.get('usage', {})}
 
     def _anthropic(self, messages, schemas):
